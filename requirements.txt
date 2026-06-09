@@ -1,0 +1,5 @@
+streamlit>=1.35
+plotly>=5.20
+duckdb>=0.10
+pandas>=2.0
+kaleido>=0.2.1
