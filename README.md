@@ -32,30 +32,46 @@ Inspirée de l'expérience **Our World in Data** : vous définissez des « ensem
 ## Lancer l'application
 
 ### Prérequis
-Python 3.10+ (recommandé 3.13 pour stabilité avec DuckDB).
+- Python 3.10+ (recommandé 3.13 pour stabilité avec DuckDB)
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) (gestionnaire de projet Python moderne)
 
+### Installation des dépendances (une seule fois)
 ```bash
 cd /chemin/vers/statteluq
-
-# Créer un environnement virtuel propre
-python3.13 -m venv .venv          # ou python3 -m venv .venv
-source .venv/bin/activate         # macOS / Linux
-# .venv\Scripts\activate          # Windows
-
-pip install -r requirements.txt
+uv sync
 ```
 
-### Lancement
+`uv sync` crée automatiquement un environnement virtuel (`.venv`) et installe les dépendances déclarées dans `pyproject.toml`.
+
+Vous pouvez aussi utiliser `uv run ...` directement (il synchronise à la volée).
+
+### Lancement manuel
 ```bash
-.venv/bin/python -m streamlit run app.py
+uv run streamlit run app.py
 ```
 
 L'application s'ouvre dans votre navigateur à l'adresse : **http://localhost:8501**
+
+### Scripts de contrôle (recommandé)
+
+Trois scripts sont fournis pour démarrer/arrêter l'application en arrière-plan :
+
+```bash
+./start.sh      # Démarre l'app (port 8501 par défaut). Écrit le PID dans .streamlit.pid
+./stop.sh       # Arrête l'app proprement
+./restart.sh    # Redémarre l'app
+```
+
+- Le port peut être changé via la variable d'environnement : `PORT=8502 ./start.sh`
+- Les logs sont écrits dans `.streamlit.log`
+- Les scripts utilisent `uv run` et gèrent automatiquement l'environnement.
 
 Si vous n'avez pas Python 3.13, installez-le :
 ```bash
 brew install python@3.13
 ```
+
+> **Note** : `requirements.txt` est conservé pour compatibilité, mais `pyproject.toml` (et `uv.lock`) est la source de vérité pour les dépendances.
 
 ## Structure des données
 
@@ -89,7 +105,7 @@ Dans chaque onglet, un accordéon « Exporter / Importer les ensembles (JSON) »
 
 ## Dépannage
 - Données non visibles : vérifiez que les deux CSV sont dans le même dossier que `app.py`
-- Export SVG : installez `kaleido` si nécessaire (`pip install kaleido`)
+- Export SVG : installez `kaleido` si nécessaire (`uv pip install kaleido` ou `uv add kaleido`)
 - Performance : DuckDB est très rapide même sur 485k lignes ; les agrégations sont quasi-instantanées
 
 ## Crédits

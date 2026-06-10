@@ -167,6 +167,32 @@ def load_trims_programmes():
     return df["ses_code"].tolist()
 
 
+@st.cache_data(ttl=3600)
+def load_uads_programmes():
+    """Distinct UAD (départements) present in the programmes data."""
+    con = get_connection()
+    df = con.execute("""
+        SELECT DISTINCT uad
+        FROM programmes
+        WHERE uad IS NOT NULL
+        ORDER BY uad
+    """).df()
+    return df["uad"].tolist()
+
+
+@st.cache_data(ttl=3600)
+def load_depts_cours():
+    """Distinct departments (Dépt.) present in the cours data."""
+    con = get_connection()
+    df = con.execute("""
+        SELECT DISTINCT dept
+        FROM cours
+        WHERE dept IS NOT NULL
+        ORDER BY dept
+    """).df()
+    return df["dept"].tolist()
+
+
 # =============================================================================
 # TIME UTILITIES (French academic calendar)
 # =============================================================================
@@ -333,6 +359,63 @@ def query_program_groups(
     if not frames:
         return pd.DataFrame(columns=["trim_code", "valeur", "ensemble"])
     return pd.concat(frames, ignore_index=True)
+
+
+def get_program_ranking(start_ses: str, end_ses: str, uads: list[str] | None = None) -> pd.DataFrame:
+    """Programs ranked by total registrations (SUM Total) for the given ses_code range.
+    If uads is provided (non-empty), only programs whose UAD is in the list are included.
+    Returns columns: prg_code, nom, uad, cycle, total (sorted desc by total).
+    """
+    con = get_connection()
+    uad_clause = ""
+    if uads:
+        in_list = ",".join(f"'{u.replace(chr(39), chr(39)+chr(39))}'" for u in uads)
+        uad_clause = f"AND uad IN ({in_list})"
+
+    sql = f"""
+        SELECT 
+            prg_code,
+            ANY_VALUE(nom) AS nom,
+            ANY_VALUE(uad) AS uad,
+            ANY_VALUE(Cycle) AS cycle,
+            SUM(Total) AS total
+        FROM programmes
+        WHERE ses_code >= '{start_ses}' AND ses_code <= '{end_ses}'
+        {uad_clause}
+        GROUP BY prg_code
+        ORDER BY total DESC
+    """
+    return con.execute(sql).df()
+
+
+def get_course_ranking(trim_code: str, depts: list[str] | None = None, metric: str = "insc_teluq") -> pd.DataFrame:
+    """Courses for a specific trimestre, sorted by the chosen metric (desc).
+    Optionally filtered to one or more departments.
+    metric: one of 'insc_teluq', 'total_insc', 'etud_nouv', 'etud_anc', 'eetp_teluq'
+    """
+    con = get_connection()
+    dept_clause = ""
+    if depts:
+        in_list = ",".join(f"'{d.replace(chr(39), chr(39)+chr(39))}'" for d in depts)
+        dept_clause = f"AND dept IN ({in_list})"
+
+    sql = f"""
+        SELECT 
+            Sigle,
+            dept,
+            insc_teluq,
+            total_insc,
+            etud_nouv,
+            etud_anc,
+            eetp_teluq,
+            non_completes,
+            aban
+        FROM cours
+        WHERE trim_code = '{trim_code}'
+        {dept_clause}
+        ORDER BY {metric} DESC
+    """
+    return con.execute(sql).df()
 
 
 # =============================================================================
@@ -680,6 +763,8 @@ def main():
     meta_prog = load_meta_programmes()
     trims_cours = load_trims_cours()
     trims_prog = load_trims_programmes()
+    uads_prog = load_uads_programmes()
+    depts_cours = load_depts_cours()
 
     all_sigles = meta_cours["Sigle"].tolist()
     all_prg_codes = meta_prog["prg_code"].tolist()
@@ -933,6 +1018,140 @@ def main():
                         mime="text/csv",
                     )
 
+        # ======================================================================
+        # NEW: Single-trim course ranking (parallel to Programmes ranking)
+        # ======================================================================
+        st.divider()
+
+        st.markdown("### 📈 Classement des cours — inscriptions pour une session")
+        st.caption(
+            "Sélectionnez une session (trimestre) précise pour voir les cours triés par nombre d'inscriptions "
+            "(selon la métrique choisie). Vous pouvez optionnellement filtrer par département."
+        )
+
+        # Specific trimestre (session)
+        if not trims_cours:
+            st.warning("Aucune session disponible dans les données cours.")
+        else:
+            # Most recent first in the list for convenience; default to latest
+            default_trim_idx = len(trims_cours) - 1
+            chosen_trim = st.selectbox(
+                "Session / Trimestre",
+                options=trims_cours,
+                index=default_trim_idx,
+                format_func=trim_label,
+                key="rank_cours_trim",
+            )
+
+            # Metric (reuse the same options as the main Cours trend UI)
+            metric_label = st.selectbox(
+                "Métrique",
+                options=[
+                    "Inscriptions TELUQ (étudiants de la TELUQ)",
+                    "Inscriptions totales (toutes provenances, inclut BCI)",
+                    "Étudiants nouveaux",
+                    "Étudiants anciens",
+                    "EETP TELUQ",
+                ],
+                index=0,
+                key="rank_cours_metric",
+            )
+            metric_map = {
+                "Inscriptions TELUQ (étudiants de la TELUQ)": "insc_teluq",
+                "Inscriptions totales (toutes provenances, inclut BCI)": "total_insc",
+                "Étudiants nouveaux": "etud_nouv",
+                "Étudiants anciens": "etud_anc",
+                "EETP TELUQ": "eetp_teluq",
+            }
+            chosen_metric = metric_map[metric_label]
+
+            # Optional department filter
+            selected_depts = st.multiselect(
+                "Départements — optionnel (vide = tous)",
+                options=depts_cours,
+                default=[],
+                key="rank_cours_depts",
+                help="Ne conserver que les cours dont le département est dans la sélection.",
+            )
+
+            cours_rank_df = get_course_ranking(
+                chosen_trim,
+                selected_depts if selected_depts else None,
+                metric=chosen_metric,
+            )
+
+            if cours_rank_df.empty:
+                st.info("Aucune donnée pour cette session / ces filtres.")
+            else:
+                # Friendly display columns + the chosen metric highlighted
+                display_c = cours_rank_df.rename(
+                    columns={
+                        "Sigle": "Sigle",
+                        "dept": "Dépt.",
+                        "insc_teluq": "Insc. TELUQ",
+                        "total_insc": "Total Insc.",
+                        "etud_nouv": "Nouveaux",
+                        "etud_anc": "Anciens",
+                        "eetp_teluq": "EETP TELUQ",
+                        "non_completes": "Non complétées",
+                        "aban": "Abandons",
+                    }
+                )
+
+                total_metric = int(cours_rank_df[chosen_metric].sum())
+                n_courses = len(cours_rank_df)
+                n_pos = int((cours_rank_df[chosen_metric] > 0).sum())
+
+                m1, m2, m3 = st.columns(3)
+                short_label = metric_label.split("(")[0].strip()
+                m1.metric(f"Total {short_label}", f"{total_metric:,}".replace(",", " "))
+                m2.metric("Cours", n_courses)
+                m3.metric("Avec inscriptions > 0", n_pos)
+
+                # Top N for the table
+                max_show_c = min(200, n_courses)
+                top_n_c = st.slider(
+                    "Nombre de cours à afficher (Top N)",
+                    min_value=10,
+                    max_value=max_show_c,
+                    value=min(50, max_show_c),
+                    step=10,
+                    key="rank_cours_topn",
+                )
+
+                # The ranked table
+                st.dataframe(
+                    display_c.head(top_n_c),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Insc. TELUQ": st.column_config.NumberColumn(format="%d"),
+                        "Total Insc.": st.column_config.NumberColumn(format="%d"),
+                        "Nouveaux": st.column_config.NumberColumn(format="%d"),
+                        "Anciens": st.column_config.NumberColumn(format="%d"),
+                        "EETP TELUQ": st.column_config.NumberColumn(format="%d"),
+                        "Non complétées": st.column_config.NumberColumn(format="%d"),
+                        "Abandons": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
+
+                # Download full ranking for this exact scope
+                csv_c_rank = display_c.to_csv(index=False).encode("utf-8")
+                safe_trim = chosen_trim.replace(" ", "_")
+                st.download_button(
+                    "⬇️ Télécharger le classement complet (CSV)",
+                    data=csv_c_rank,
+                    file_name=f"classement_cours_{safe_trim}.csv",
+                    mime="text/csv",
+                    key=f"dl_rank_cours_{chosen_trim}",
+                )
+
+                dept_info = "tous" if not selected_depts else ", ".join(selected_depts)
+                st.markdown(
+                    f"<div class='source'>Session : {trim_label(chosen_trim, False)} ({chosen_trim}) | Dépt. : {dept_info} | Métrique : {metric_label}</div>",
+                    unsafe_allow_html=True,
+                )
+
     # ==========================================================================
     # TAB PROGRAMMES
     # ==========================================================================
@@ -1041,6 +1260,126 @@ def main():
                         file_name=f"programmes_{granularity_p.replace(' ', '_')}.csv",
                         mime="text/csv",
                     )
+
+        # ======================================================================
+        # NEW: Single-period program ranking / leaderboard
+        # ======================================================================
+        st.divider()
+
+        st.markdown("### 📈 Classement des programmes — inscriptions pour une période")
+        st.caption(
+            "Choisissez un semestre ou une année complète pour voir tous les programmes "
+            "triés par nombre total d'inscriptions (colonne Total du fichier source). "
+            "Vous pouvez optionnellement filtrer par département (UAD)."
+        )
+
+        rank_gran_label = st.selectbox(
+            "Granularité",
+            ["Par semestre", "Par année civile", "Par année académique (début automne)"],
+            index=0,
+            key="rank_granularity",
+        )
+
+        gran_for_periods = {
+            "Par semestre": "Par trimestre",
+            "Par année civile": "Par année civile",
+            "Par année académique (début automne)": "Par année académique (début automne)",
+        }[rank_gran_label]
+
+        periods_rank = get_available_periods(trims_prog, gran_for_periods)
+        if not periods_rank:
+            st.warning("Aucune période disponible dans les données programmes.")
+        else:
+            labels_rank = [p["label"] for p in periods_rank]
+            label_to_p = {p["label"]: p for p in periods_rank}
+
+            # Most recent by default
+            default_idx = len(labels_rank) - 1
+            chosen_label = st.selectbox(
+                "Période",
+                options=labels_rank,
+                index=default_idx,
+                key="rank_period",
+            )
+            chosen_period = label_to_p[chosen_label]
+            r_start, r_end = chosen_period["start_trim"], chosen_period["end_trim"]
+
+            # Optional department filter
+            selected_uads = st.multiselect(
+                "Départements (UAD) — optionnel (vide = tous)",
+                options=uads_prog,
+                default=[],
+                key="rank_uads",
+                help="Ne conserver que les programmes dont le code UAD est dans la sélection.",
+            )
+
+            ranking_df = get_program_ranking(r_start, r_end, selected_uads if selected_uads else None)
+
+            if ranking_df.empty:
+                st.info("Aucune inscription trouvée pour cette sélection.")
+            else:
+                # Friendly column names
+                display_df = ranking_df.rename(
+                    columns={
+                        "prg_code": "Code",
+                        "nom": "Programme",
+                        "uad": "UAD",
+                        "cycle": "Cycle",
+                        "total": "Inscriptions",
+                    }
+                )
+
+                total_insc = int(display_df["Inscriptions"].sum())
+                n_programs = len(display_df)
+                n_with = int((display_df["Inscriptions"] > 0).sum())
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Inscriptions totales", f"{total_insc:,}".replace(",", " "))
+                m2.metric("Programmes", n_programs)
+                m3.metric("Avec inscriptions > 0", n_with)
+
+                # Top N control (table only)
+                max_show = min(100, n_programs)
+                top_n = st.slider(
+                    "Nombre de programmes à afficher (Top N)",
+                    min_value=5,
+                    max_value=max_show,
+                    value=min(30, max_show),
+                    step=5,
+                    key="rank_topn",
+                )
+
+                # The ranked table (no chart)
+                st.dataframe(
+                    display_df.head(top_n),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Inscriptions": st.column_config.NumberColumn("Inscriptions", format="%d"),
+                    },
+                )
+
+                # Download the full result for the chosen scope
+                csv_rank = display_df.to_csv(index=False).encode("utf-8")
+                safe_label = (
+                    chosen_label.replace(" ", "_")
+                    .replace("—", "-")
+                    .replace("(", "")
+                    .replace(")", "")
+                )
+                st.download_button(
+                    "⬇️ Télécharger le classement complet (CSV)",
+                    data=csv_rank,
+                    file_name=f"classement_programmes_{safe_label}.csv",
+                    mime="text/csv",
+                    key=f"dl_rank_{chosen_label}",
+                )
+
+                uad_info = "tous" if not selected_uads else ", ".join(selected_uads)
+                st.markdown(
+                    f"<div class='source'>Période : {r_start} → {r_end} | UAD : {uad_info}</div>",
+                    unsafe_allow_html=True,
+                )
 
     # Sidebar info
     with st.sidebar:
